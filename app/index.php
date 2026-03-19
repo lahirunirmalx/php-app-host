@@ -30,6 +30,8 @@ if ($repo === '' || $token === '') {
 $tz = isset($env['TZ']) ? trim($env['TZ']) : 'UTC';
 date_default_timezone_set($tz);
 $today = date('Y-m-d');
+$now = date('Y-m-d H:i:s');
+$branchTime = date('Y-m-d-H-i-s');
 $yesterdayStart = date('Y-m-d 00:00:00', strtotime('-1 day'));
 $yesterdayEnd = date('Y-m-d 00:00:00');
 
@@ -41,11 +43,15 @@ if (!clone_repo($cloneUrl, $cloneDir)) {
     exit(1);
 }
 
-$branchName = 'daily/' . $today;
-$random = (string) mt_rand(100000, 999999);
-$filePath = 'daily' . DIRECTORY_SEPARATOR . $today . '.txt';
-$fileContent = $today . ' ' . $random . "\n";
+$branchName = 'daily/' . $branchTime;
+$epoch = time();
+$random = mt_rand(100000, 999999);
+$filePath = 'daily' . DIRECTORY_SEPARATOR . $branchTime . '.txt';
+$fileContent = $today . ' ' . (string) $random . ' ' . (string) $epoch . "\n";
 $commitMsg = 'Daily commit ' . $today . ' ' . $random;
+
+$distanceFromEpoch = abs($epoch - $random);
+echo "Random " . $random . " is " . $distanceFromEpoch . " from epoch " . $epoch . "\n";
 
 if (!do_commit_and_push($cloneDir, $branchName, $filePath, $fileContent, $commitMsg)) {
     cleanup($cloneDir);
@@ -58,18 +64,18 @@ $api = function ($method, $path, $body = null) use ($repo, $token) {
 };
 
 if ($api('POST', '/pulls', [
-    'title' => 'Daily merge ' . $today,
+    'title' => 'Daily merge ' . $now,
     'head'  => $branchName,
     'base'  => 'main',
-    'body'  => 'Auto PR for ' . $today,
+    'body'  => 'Auto PR for ' . $now,
 ]) === null) {
     cleanup($cloneDir);
     fwrite(STDERR, "Create PR failed.\n");
     exit(1);
 }
 
-$openPrs = $api('GET', '/pulls?state=open');
-if (!is_array($openPrs)) {
+$openPrs = fetch_all_open_prs($api);
+if ($openPrs === null) {
     cleanup($cloneDir);
     fwrite(STDERR, "List PRs failed.\n");
     exit(1);
@@ -80,6 +86,10 @@ foreach ($yesterdayPrs as $pr) {
     $num = isset($pr['number']) ? (int) $pr['number'] : 0;
     if ($num > 0) {
         $api('PUT', '/pulls/' . $num . '/merge', ['commit_title' => 'Merge PR #' . $num]);
+        $headRef = isset($pr['head']['ref']) ? trim($pr['head']['ref']) : '';
+        if ($headRef !== '') {
+            $api('DELETE', '/git/refs/heads/' . rawurlencode($headRef));
+        }
     }
 }
 
@@ -158,22 +168,76 @@ function do_commit_and_push($dir, $branch, $filePath, $content, $commitMsg)
     if (@file_put_contents($fullPath, $content) === false) {
         return false;
     }
-    $cmd = 'git -C ' . $dirEsc . ' config user.email "daily@localhost" 2>&1';
-    shell_exec($cmd);
-    $cmd = 'git -C ' . $dirEsc . ' config user.name "daily-commit" 2>&1';
-    shell_exec($cmd);
-    $cmd = 'git -C ' . $dirEsc . ' checkout -b ' . $branchEsc . ' 2>&1';
-    shell_exec($cmd);
+    $run = function ($cmd) {
+        $lines = [];
+        exec($cmd . ' 2>&1', $lines, $code);
+        return [$code, implode("\n", $lines)];
+    };
+
+    $cmd = 'git -C ' . $dirEsc . ' config user.email "daily@localhost"';
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git config user.email failed: " . $out . "\n");
+        return false;
+    }
+    $cmd = 'git -C ' . $dirEsc . ' config user.name "daily-commit"';
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git config user.name failed: " . $out . "\n");
+        return false;
+    }
+    $cmd = 'git -C ' . $dirEsc . ' checkout -b ' . $branchEsc;
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git checkout -b failed: " . $out . "\n");
+        return false;
+    }
     $fileEsc = escapeshellarg($filePath);
-    $cmd = 'git -C ' . $dirEsc . ' add ' . $fileEsc . ' 2>&1';
-    shell_exec($cmd);
+    $cmd = 'git -C ' . $dirEsc . ' add ' . $fileEsc;
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git add failed: " . $out . "\n");
+        return false;
+    }
     $msgEsc = escapeshellarg($commitMsg);
-    $cmd = 'git -C ' . $dirEsc . ' commit -m ' . $msgEsc . ' 2>&1';
-    shell_exec($cmd);
-    $cmd = 'git -C ' . $dirEsc . ' push -u origin ' . $branchEsc . ' 2>&1';
-    $lines = [];
-    exec($cmd, $lines, $pushCode);
-    return $pushCode === 0;
+    $cmd = 'git -C ' . $dirEsc . ' commit -m ' . $msgEsc;
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git commit failed: " . $out . "\n");
+        return false;
+    }
+
+    $cmd = 'git -C ' . $dirEsc . ' fetch origin';
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git fetch failed: " . $out . "\n");
+        return false;
+    }
+    $cmd = 'git -C ' . $dirEsc . ' pull --rebase origin ' . $branchEsc;
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        if (strpos($out, 'couldn\'t find remote ref') !== false || strpos($out, 'No refs to pull') !== false) {
+            /* Remote branch does not exist yet, push will create it */
+        } else {
+            /* Rebase failed (e.g. conflict on same file). Abort and force push so this run wins. */
+            $run('git -C ' . $dirEsc . ' rebase --abort');
+            $cmd = 'git -C ' . $dirEsc . ' push --force -u origin ' . $branchEsc;
+            list($code, $out) = $run($cmd);
+            if ($code !== 0) {
+                fwrite(STDERR, "git push --force failed: " . $out . "\n");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    $cmd = 'git -C ' . $dirEsc . ' push -u origin ' . $branchEsc;
+    list($code, $out) = $run($cmd);
+    if ($code !== 0) {
+        fwrite(STDERR, "git push failed: " . $out . "\n");
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -218,7 +282,34 @@ function github_api($repo, $token, $method, $path, $body = null)
         return null;
     }
     $decoded = json_decode($raw, true);
+    if ($code >= 200 && $code < 300 && $decoded === null && $raw === '') {
+        return true;
+    }
     return is_array($decoded) ? $decoded : (is_object($decoded) ? (array) $decoded : null);
+}
+
+/**
+ * Fetch all open PRs (paginated).
+ *
+ * @param callable $api function($method, $path, $body = null)
+ * @return array|null
+ */
+function fetch_all_open_prs($api)
+{
+    $all = [];
+    $page = 1;
+    $perPage = 100;
+    do {
+        $prs = $api('GET', '/pulls?state=open&per_page=' . $perPage . '&page=' . $page);
+        if (!is_array($prs)) {
+            return $page === 1 ? null : $all;
+        }
+        foreach ($prs as $pr) {
+            $all[] = $pr;
+        }
+        $page++;
+    } while (count($prs) === $perPage);
+    return $all;
 }
 
 /**
